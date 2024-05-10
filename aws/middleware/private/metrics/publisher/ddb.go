@@ -12,35 +12,41 @@ import (
 // DDBPublisher is a MetricPublisher implementation that publishes metrics to DDB
 type DDBPublisher struct {
 	additionalDimensions map[string]string
-	metricDataEntries    []*metrics.MetricData
+	requestDataEntries   []*metrics.MetricData
+	streamDataEntries    []*metrics.MetricData
 	totalAttempts        int // recorded in advance to calculate attempt metrics average
 }
 
 func NewDDBPublisher() *DDBPublisher {
 	return &DDBPublisher{
 		additionalDimensions: map[string]string{},
-		metricDataEntries:    []*metrics.MetricData{},
+		requestDataEntries:   []*metrics.MetricData{},
+		streamDataEntries:    []*metrics.MetricData{},
 	}
 }
 
+// SetAdditionalDimension adds a dimension's to additionalDimensions
 func (p *DDBPublisher) SetAdditionalDimension(key string, value string) {
 	p.additionalDimensions[key] = value
 }
 
+// RemoveAdditionalDimension removes a dimension from additionalDimensions
 func (p *DDBPublisher) RemoveAdditionalDimension(key string) {
 	delete(p.additionalDimensions, key)
 }
 
 // PostRequestMetrics stores the request metrics in DDBPublisher
 func (p *DDBPublisher) PostRequestMetrics(data *metrics.MetricData) error {
-	p.metricDataEntries = append(p.metricDataEntries, data)
+	p.requestDataEntries = append(p.requestDataEntries, data)
 	p.totalAttempts = p.totalAttempts + len(data.Attempts)
 	return nil
 }
 
-// PostStreamMetrics does nothing in DDBPublisher since all data will
-// just be cached per request and averaged during Output
+// PostStreamMetrics caches stream metrics to DDBPublisher
 func (p *DDBPublisher) PostStreamMetrics(data *metrics.MetricData) error {
+	if data.Stream.Throughput > 0 {
+		p.streamDataEntries = append(p.streamDataEntries, data)
+	}
 	return nil
 }
 
@@ -50,17 +56,42 @@ type ddbClient interface {
 
 // Output calculate average metrics and send that to ddb
 func (p *DDBPublisher) Output(svc ddbClient, tableName string) error {
-	if len(p.metricDataEntries) == 0 {
+	if len(p.requestDataEntries) == 0 {
 		return fmt.Errorf("no metric data is cached in publisher")
 	}
 
 	entry := ddb.NewEntry()
 	p.populateWithAdditionalDimensions(&entry)
 
-	// this dimension must be added in Output since each
-	serviceOperation := fmt.Sprintf("%s.%s", p.metricDataEntries[0].ServiceID, p.metricDataEntries[0].OperationName)
-	entry.AddDimension("ServiceOperation", serviceOperation)
+	// this 2 dimensions might not need since they can be identified through the input tableName
+	// e.g. tableName = S3.PutObject
+	entry.AddDimension(metrics.ServiceIDKey, p.requestDataEntries[0].ServiceID)
+	entry.AddDimension(metrics.OperationNameKey, p.requestDataEntries[0].OperationName)
 
+	p.averageRequestMetrics(&entry)
+
+	p.averageStreamMetrics(&entry)
+
+	item, err := entry.Build()
+	if err != nil {
+		return fmt.Errorf("error generating ddb item for metric: %s", err.Error())
+	}
+
+	_, err = svc.PutItem(context.Background(), &dynamodb.PutItemInput{
+		TableName: aws.String(tableName),
+		Item:      item,
+	})
+	if err != nil {
+		return err
+	}
+
+	// cleans our stored metricDataEntries for next round test
+	p.requestDataEntries = []*metrics.MetricData{}
+	p.streamDataEntries = []*metrics.MetricData{}
+	return nil
+}
+
+func (p DDBPublisher) averageRequestMetrics(entry *ddb.Entry) {
 	// average metrics per request
 	var apiCallDuration float64
 	var apiCallSuccessful float64
@@ -83,8 +114,8 @@ func (p *DDBPublisher) Output(svc ddbClient, tableName string) error {
 	var serviceCallDuration float64
 	var backoffDelayDuration float64
 
-	size := float64(len(p.metricDataEntries))
-	for _, data := range p.metricDataEntries {
+	size := float64(len(p.requestDataEntries))
+	for _, data := range p.requestDataEntries {
 		apiCallDuration += float64(data.APICallDuration.Nanoseconds()) / size
 		marshallingDuration += float64(data.MarshallingDuration.Nanoseconds()) / size
 		endpointResolutionDuration += float64(data.EndpointResolutionDuration.Nanoseconds()) / size
@@ -136,24 +167,16 @@ func (p *DDBPublisher) Output(svc ddbClient, tableName string) error {
 	entry.AddMetric(metrics.TimeToFirstByteKey, timeToFirstByte)
 	entry.AddMetric(metrics.ServiceCallDurationKey, serviceCallDuration)
 	entry.AddMetric(metrics.BackoffDelayDurationKey, backoffDelayDuration)
+}
 
-	item, err := entry.Build()
-	if err != nil {
-		return fmt.Errorf("error generating ddb item for metric: %s", err.Error())
+func (p DDBPublisher) averageStreamMetrics(entry *ddb.Entry) {
+	if size := float64(len(p.streamDataEntries)); size > 0 {
+		var throughput float64
+		for _, data := range p.streamDataEntries {
+			throughput += data.Stream.Throughput / size
+		}
+		entry.AddMetric(metrics.StreamThroughputKey, throughput)
 	}
-
-	_, err = svc.PutItem(context.Background(), &dynamodb.PutItemInput{
-		TableName: aws.String(tableName),
-		Item:      item,
-	})
-	if err != nil {
-		return err
-	}
-
-	// cleans our stored metricDataEntries for next round test
-	p.metricDataEntries = []*metrics.MetricData{}
-
-	return nil
 }
 
 func (p *DDBPublisher) populateWithAdditionalDimensions(entry *ddb.Entry) {

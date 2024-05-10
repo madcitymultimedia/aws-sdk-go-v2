@@ -56,7 +56,7 @@ func TestBuild(t *testing.T) {
 			ExpectedError: nil,
 			ExpectedResult: map[string]types.AttributeValue{
 				"testMetric1": &types.AttributeValueMemberN{
-					Value: "1",
+					Value: "1.00",
 				},
 				"testDimension1": &types.AttributeValueMemberS{
 					Value: "dim1",
